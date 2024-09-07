@@ -44,7 +44,6 @@ gemma2_config = transformer_lib.TransformerConfig.gemma2_2b(1024)
 gemma2_config = gemma2_config.from_params(params=params)
 transformer = transformer_lib.Transformer(gemma2_config)
 # %%
-
 dummy_input = jnp.zeros((batch_size, seq_length)).astype(jnp.int32)
 dummy_positions = jnp.arange(seq_length)[None, :]
 dummy_attention_mask = jnp.ones((batch_size, seq_length, seq_length))
@@ -83,7 +82,7 @@ def flatten_intermediates(intermediates):
 
     main_keys = ['pre_attention_norm', 'post_attention_norm',
                  'pre_ffw_norm', 'mlp', 'post_ffw_norm']
-    attn_keys = ['q_einsum', 'kv_einsum',
+    attn_keys = ['q_einsum', 'kv_einsum', "reshaped_scaled_q",
                  'attn_vec_einsum', 'roped_q', "roped_k", "scaled_q", "att_logits", "capped_logits"]
 
     for key in main_keys + attn_keys:
@@ -224,9 +223,11 @@ intermediates['scaled_q_'] = rearrange(
 )
 print(compare_tensors(q_scaled, intermediates['scaled_q_'][0]))
 
-# logits = jnp.einsum('BTKGH,BSKH->BTKGS', q_scaled, k)
-# logits = logits.reshape((b, t, n_kv * g, s))
-
+logits = jnp.einsum('BTKGH,BSKH->BTKGS', q_scaled, k)
+logits = rearrange(logits, "B T K G S -> B T (K G) S")
+print(compare_tensors(q_scaled, intermediates['reshaped_scaled_q'][0]))
+# print(compare_tensors(logits, intermediates['att_logits'][0]))
+jnp.abs(q_scaled - intermediates['reshaped_scaled_q'][0]) < 1e-2
 # %%
 intermediates['q'] = rearrange(
     intermediates['q_einsum'], "layer b Qlen (n_q_per_kv n_kv) d_head -> layer b Qlen n_q_per_kv n_kv d_head",
