@@ -183,6 +183,7 @@ weights = params['transformer']
 rope_table = RopeTable(seq_length, h)
 unembed = embed = weights['embedder']['input_embedding']
 ln1 = weights["layer_0"]['pre_attention_norm']['scale']
+ln2 = weights["layer_0"]['pre_ffw_norm']['scale']
 w_q = weights["layer_0"]['attn']['q_einsum']['w']
 w_q = rearrange(
     w_q,
@@ -195,7 +196,7 @@ w_kv = rearrange(
     w_kv,
     ("k_v n_kv M_dim H_dim -> k_v M_dim n_kv H_dim")
 )
-# w_o = num_heads * d_head * d_model
+
 w_o = weights["layer_0"]['attn']['attn_vec_einsum']['w']
 w_o = rearrange(
     w_o,
@@ -203,7 +204,7 @@ w_o = rearrange(
     n_q_per_kv=h.n_q_per_kv,
     n_kv=h.n_kv,
 )
-#  M Q K/t D
+
 causal_mask = jnp.tril(
     jnp.ones((batch_size, L, L), dtype=jnp.bool_), 0
 )[..., jnp.newaxis, jnp.newaxis, :]
@@ -211,7 +212,15 @@ local_mask = jnp.triu(
     jnp.ones((batch_size, L, L), dtype=jnp.bool_), 1 - h.window_size
 )[..., jnp.newaxis, jnp.newaxis, :]
 
+post_att_ln = weights["layer_0"]['post_attention_norm']['scale']
 use_local_window_attn = False
+
+w_gate, w_up = weights["layer_0"]['mlp']['gating_einsum']
+w_down = weights["layer_0"]['mlp']['linear']
+w_down = rearrange(
+    w_down, "F M -> M F"
+)
+post_ffw_ln = weights["layer_0"]['post_ffw_norm']['scale']
 # %%
 # forward pass
 ids = dummy_input
@@ -226,15 +235,11 @@ k, v = einsum(
 # %%
 q = rope_table.apply("L d -> 1 L 1 1 d", q)
 k = rope_table.apply("L d -> 1 L 1 d", k)
-# %%
 q_test = rearrange(
     q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head",
 )
-print(compare_tensors(q_test, intermediates['roped_q'][0]))
-# %%
 q_preatt_scalar = h.d_head ** -0.5
 q_scaled = q * q_preatt_scalar
-# %%
 print(compare_tensors(q_scaled, intermediates['reshaped_scaled_q'][0]))
 # %%
 logits = einsum(
@@ -263,34 +268,21 @@ a_out = einsum(
     a_out, w_o, "B Qlen n_kv n_q_per_kv d_head, d_model n_kv n_q_per_kv d_head -> B Qlen d_model"
 )
 print(compare_tensors(a_out, intermediates['a_out'][0]))
+a_out = rms_norm(a_out) * (1.0 + post_att_ln)
+print(compare_tensors(a_out, intermediates['post_attention_norm'][0]))
+x += a_out
+nx = rms_norm(x) * (1.0 + ln2)
+print(compare_tensors(nx, intermediates['pre_ffw_norm'][0]))
 # %%
-print(compare_tensors(x, intermediates["tracked_embed"]))
-print(compare_tensors(nx, intermediates["pre_attention_norm"][0]))
-print(compare_tensors(v, intermediates['v'][0]))
-print(compare_tensors(k, intermediates['roped_k'][0]))
-print(compare_tensors(logits, intermediates["att_logits"][0]))
-# %%
-intermediates["att_logits"][0]
-# %%
+# ffw network
+# FFN, using SwiGLU
+gate_proj = einsum(nx, w_gate, "B L M, M F -> B L F")
+up_proj = einsum(nx, w_up, "B L M, M F -> B L F")
+y = jax.nn.gelu(gate_proj) * up_proj
+ffn_out = einsum(y, w_down, "B L F, M F -> B L M")
+print(compare_tensors(ffn_out, intermediates['mlp'][0]))
+ffn_out = rms_norm(ffn_out) * (1.0 + post_ffw_ln)
+print(compare_tensors(ffn_out, intermediates['post_ffw_norm'][0]))
 
-print(compare_tensors(logits, intermediates["att_logits"][0]))
-logits = rearrange(
-    logits, "B Qlen Klen n_q_per_kv n_kv -> B Qlen (n_q_per_kv n_kv) Klen ")
-#
-# %%
-logits - intermediates["att_logits"][0]
-
-
-# %%
-logits = einsum(
-    intermediates['roped_q'][0],
-    intermediates['roped_k'][0],
-    "B Qlen n_kv n_q_per_kv D, B Klen n_kv D -> B Qlen Klen n_q_per_kv n_kv",
-)
-
-logits = rearrange(
-    logits, "B Qlen Klen n_q_per_kv n_kv -> B Qlen (n_q_per_kv n_kv) Klen ")
-# %%
-logits - intermediates["att_logits"][0]
 
 # %%
