@@ -46,7 +46,10 @@ transformer = transformer_lib.Transformer(gemma2_config)
 # %%
 dummy_input = jnp.zeros((batch_size, seq_length)).astype(jnp.int32)
 dummy_positions = jnp.arange(seq_length)[None, :]
-dummy_attention_mask = jnp.ones((batch_size, seq_length, seq_length))
+dummy_attention_mask = jnp.tril(
+    jnp.ones((batch_size, seq_length, seq_length), dtype=jnp.bool_), 0
+)
+
 # %%
 (logits, cache), intermediates = transformer.apply(
     {'params': params["transformer"]},
@@ -83,7 +86,10 @@ def flatten_intermediates(intermediates):
     main_keys = ['pre_attention_norm', 'post_attention_norm',
                  'pre_ffw_norm', 'mlp', 'post_ffw_norm']
     attn_keys = ['q_einsum', 'kv_einsum', "reshaped_scaled_q",
-                 'attn_vec_einsum', 'roped_q', "roped_k", "scaled_q", "att_logits", "capped_logits"]
+                 'attn_vec_einsum', 'roped_q', "roped_k", "scaled_q",
+                 "att_logits", "capped_logits", "att_wei", "a_out_premix",
+                 "a_out"
+                 ]
 
     for key in main_keys + attn_keys:
         layer_values = []
@@ -169,6 +175,7 @@ class RopeTable:
 
 
 # %%
+L = seq_length
 h = Hparams()
 # %%
 # weight init
@@ -179,7 +186,7 @@ ln1 = weights["layer_0"]['pre_attention_norm']['scale']
 w_q = weights["layer_0"]['attn']['q_einsum']['w']
 w_q = rearrange(
     w_q,
-    "(n_q_per_kv n_kv) d_model d_head -> d_model n_q_per_kv n_kv d_head",
+    "(n_kv n_q_per_kv) d_model d_head -> d_model n_kv n_q_per_kv d_head",
     n_q_per_kv=h.n_q_per_kv,
     n_kv=h.n_kv,
 )
@@ -188,6 +195,23 @@ w_kv = rearrange(
     w_kv,
     ("k_v n_kv M_dim H_dim -> k_v M_dim n_kv H_dim")
 )
+# w_o = num_heads * d_head * d_model
+w_o = weights["layer_0"]['attn']['attn_vec_einsum']['w']
+w_o = rearrange(
+    w_o,
+    "(n_kv n_q_per_kv) d_head d_model -> d_model n_kv n_q_per_kv d_head",
+    n_q_per_kv=h.n_q_per_kv,
+    n_kv=h.n_kv,
+)
+#  M Q K/t D
+causal_mask = jnp.tril(
+    jnp.ones((batch_size, L, L), dtype=jnp.bool_), 0
+)[..., jnp.newaxis, jnp.newaxis, :]
+local_mask = jnp.triu(
+    jnp.ones((batch_size, L, L), dtype=jnp.bool_), 1 - h.window_size
+)[..., jnp.newaxis, jnp.newaxis, :]
+
+use_local_window_attn = False
 # %%
 # forward pass
 ids = dummy_input
@@ -195,50 +219,50 @@ x = embed[ids]
 x *= jnp.sqrt(h.d_model)
 nx = rms_norm(x) * (1.0 + ln1)
 q = einsum(
-    nx, w_q, "B Qlen M_dim, M_dim n_per_kv n_kv H_dim -> B Qlen n_kv n_per_kv H_dim")
+    nx, w_q, "B Qlen d_model, d_model n_kv n_q_per_kv d_head -> B Qlen n_kv n_q_per_kv d_head")
 k, v = einsum(
-    nx, w_kv, "B Klen M_dim, k_v M_dim n_kv H_dim -> k_v B Klen n_kv H_dim"
+    nx, w_kv, "B Klen d_model, k_v d_model n_kv d_head -> k_v B Klen n_kv d_head"
 )
 # %%
 q = rope_table.apply("L d -> 1 L 1 1 d", q)
 k = rope_table.apply("L d -> 1 L 1 d", k)
 # %%
-
-intermediates['roped_q_'] = rearrange(
-    intermediates['roped_q'], "layer b Qlen (n_q_per_kv n_kv) d_head -> layer b Qlen n_kv n_q_per_kv d_head",
-    n_q_per_kv=h.n_q_per_kv,
-    n_kv=h.n_kv,
+q_test = rearrange(
+    q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head",
 )
-print(compare_tensors(q, intermediates['roped_q_'][0]))
-q.shape, intermediates['roped_q_'][0].shape
+print(compare_tensors(q_test, intermediates['roped_q'][0]))
 # %%
 q_preatt_scalar = h.d_head ** -0.5
 q_scaled = q * q_preatt_scalar
-
 # %%
-intermediates['scaled_q_'] = rearrange(
-    intermediates['scaled_q'], "layer b Qlen (n_q_per_kv n_kv) d_head -> layer b Qlen n_kv n_q_per_kv d_head",
-    n_q_per_kv=h.n_q_per_kv,
-    n_kv=h.n_kv,
-)
-print(compare_tensors(q_scaled, intermediates['scaled_q_'][0]))
-
-logits = jnp.einsum('BTKGH,BSKH->BTKGS', q_scaled, k)
-logits = rearrange(logits, "B T K G S -> B T (K G) S")
 print(compare_tensors(q_scaled, intermediates['reshaped_scaled_q'][0]))
-# print(compare_tensors(logits, intermediates['att_logits'][0]))
-jnp.abs(q_scaled - intermediates['reshaped_scaled_q'][0]) < 1e-2
 # %%
-intermediates['q'] = rearrange(
-    intermediates['q_einsum'], "layer b Qlen (n_q_per_kv n_kv) d_head -> layer b Qlen n_q_per_kv n_kv d_head",
-    n_q_per_kv=h.n_q_per_kv,
-    n_kv=h.n_kv,
+logits = einsum(
+    q_scaled, k, 'B Qlen n_kv n_q_per_kv d_head, B Klen n_kv d_head -> B Qlen n_kv n_q_per_kv Klen')
+logits = jnp.tanh(logits / h.attn_softcap) * h.attn_softcap
+logits_test = rearrange(
+    logits, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen")
+print(compare_tensors(logits_test, intermediates['capped_logits'][0]))
+# %%
+attn_mask = jax.lax.select(
+    use_local_window_attn,
+    jnp.logical_and(causal_mask, local_mask),
+    causal_mask,
 )
-intermediates['k'] = intermediates['kv_einsum'][:, 0]
-intermediates['v'] = intermediates['kv_einsum'][:, 1]
-
-intermediates['att_logits'][0].shape
-
+logits = jnp.where(attn_mask, logits, -1e10)
+probs = (jax.nn.softmax(logits, axis=-1).astype(logits.dtype))
+probs_test = rearrange(
+    probs, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen"
+)
+print(compare_tensors(probs_test, intermediates['att_wei'][0]))
+# %%
+a_out = einsum(
+    probs, v, "B Qlen n_kv n_q_per_kv Klen, B Klen n_kv d_head -> B Qlen n_kv n_q_per_kv d_head"
+)
+a_out = einsum(
+    a_out, w_o, "B Qlen n_kv n_q_per_kv d_head, d_model n_kv n_q_per_kv d_head -> B Qlen d_model"
+)
+print(compare_tensors(a_out, intermediates['a_out'][0]))
 # %%
 print(compare_tensors(x, intermediates["tracked_embed"]))
 print(compare_tensors(nx, intermediates["pre_attention_norm"][0]))
