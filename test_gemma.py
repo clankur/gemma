@@ -22,7 +22,7 @@ os.environ["XLA_FLAGS"] = (
 )
 
 
-kagglehub.login()
+# kagglehub.login()
 # %%
 kagglehub.model_download("google/gemma-2/flax/gemma2-2b")
 
@@ -60,12 +60,6 @@ dummy_attention_mask = jnp.tril(
     capture_intermediates=True
 
 )
-# %%
-print(intermediates['intermediates'].keys())
-print(intermediates['intermediates']['layer_0'].keys())
-print(intermediates['intermediates']['layer_0']
-      ["attn"].keys())
-
 
 # %%
 
@@ -84,11 +78,11 @@ def flatten_intermediates(intermediates):
         return None
 
     main_keys = ['pre_attention_norm', 'post_attention_norm',
-                 'pre_ffw_norm', 'mlp', 'post_ffw_norm']
+                 'pre_ffw_norm', 'mlp', 'post_ffw_norm', "final_output"]
     attn_keys = ['q_einsum', 'kv_einsum', "reshaped_scaled_q",
                  'attn_vec_einsum', 'roped_q', "roped_k", "scaled_q",
                  "att_logits", "capped_logits", "att_wei", "a_out_premix",
-                 "a_out"
+                 "a_out", "masked_logits"
                  ]
 
     for key in main_keys + attn_keys:
@@ -177,10 +171,10 @@ class RopeTable:
 # %%
 L = seq_length
 h = Hparams()
+K_MASK = -2.3819763e38
 # %%
 # weight init
 weights = params['transformer']
-rope_table = RopeTable(seq_length, h)
 unembed = embed = weights['embedder']['input_embedding']
 ln1 = weights["layer_0"]['pre_attention_norm']['scale']
 ln2 = weights["layer_0"]['pre_ffw_norm']['scale']
@@ -205,16 +199,7 @@ w_o = rearrange(
     n_kv=h.n_kv,
 )
 
-causal_mask = jnp.tril(
-    jnp.ones((batch_size, L, L), dtype=jnp.bool_), 0
-)[..., jnp.newaxis, jnp.newaxis, :]
-local_mask = jnp.triu(
-    jnp.ones((batch_size, L, L), dtype=jnp.bool_), 1 - h.window_size
-)[..., jnp.newaxis, jnp.newaxis, :]
-
 post_att_ln = weights["layer_0"]['post_attention_norm']['scale']
-use_local_window_attn = False
-
 w_gate, w_up = weights["layer_0"]['mlp']['gating_einsum']
 w_down = weights["layer_0"]['mlp']['linear']
 w_down = rearrange(
@@ -222,67 +207,232 @@ w_down = rearrange(
 )
 post_ffw_ln = weights["layer_0"]['post_ffw_norm']['scale']
 # %%
-# forward pass
+rope_table = RopeTable(seq_length, h)
+use_local_window_attn = False
+causal_mask = jnp.tril(
+    jnp.ones((batch_size, L, L), dtype=jnp.bool_), 0
+)[..., jnp.newaxis, jnp.newaxis, :]
+local_mask = jnp.triu(
+    jnp.ones((batch_size, L, L), dtype=jnp.bool_), 1 - h.window_size
+)[..., jnp.newaxis, jnp.newaxis, :]
+
+# %%
+
+
+def flatten_params_to_tensors(params, h):
+    # Use h.n_layers instead of counting
+    num_layers = h.layers
+
+    # Process embeddings
+    embed = params['transformer']['embedder']['input_embedding']
+
+    # Initialize lists to hold layer-specific tensors
+    pre_attention_norms = []
+    pre_ffw_norms = []
+    attn_qs = []
+    attn_kvs = []
+    attn_os = []
+    post_attention_norms = []
+    mlp_gates = []
+    mlp_ups = []
+    mlp_downs = []
+    post_ffw_norms = []
+
+    # Process each layer
+    for i in range(num_layers):
+        layer_key = f'layer_{i}'
+        layer = params['transformer'][layer_key]
+
+        # Attention related tensors
+        pre_attention_norms.append(layer['pre_attention_norm']['scale'])
+        pre_ffw_norms.append(layer['pre_ffw_norm']['scale'])
+
+        w_q = layer['attn']['q_einsum']['w']
+        w_q = rearrange(w_q, "(n_kv n_q_per_kv) d_model d_head -> d_model n_kv n_q_per_kv d_head",
+                        n_q_per_kv=h.n_q_per_kv, n_kv=h.n_kv)
+        attn_qs.append(w_q)
+
+        w_kv = layer['attn']['kv_einsum']['w']
+        w_kv = rearrange(w_kv, "k_v n_kv M_dim H_dim -> k_v M_dim n_kv H_dim")
+        attn_kvs.append(w_kv)
+
+        w_o = layer['attn']['attn_vec_einsum']['w']
+        print(w_o.shape)
+        attn_os.append(w_o)
+
+        # MLP related tensors
+        post_attention_norms.append(layer['post_attention_norm']['scale'])
+        mlp_gates.append(layer['mlp']['gating_einsum'][0])
+        mlp_ups.append(layer['mlp']['gating_einsum'][1])
+        w_down = rearrange(layer['mlp']['linear'], "F M -> M F")
+        mlp_downs.append(w_down)
+        post_ffw_norms.append(layer['post_ffw_norm']['scale'])
+
+    # Stack layer-specific tensors
+    pre_attention_norm = jnp.stack(pre_attention_norms)
+    pre_ffw_norm = jnp.stack(pre_ffw_norms)
+    attn_q = jnp.stack(attn_qs)
+    attn_kv = jnp.stack(attn_kvs)
+    attn_o = jnp.stack(attn_os)
+    post_attention_norm = jnp.stack(post_attention_norms)
+    mlp_gate = jnp.stack(mlp_gates)
+    mlp_up = jnp.stack(mlp_ups)
+    mlp_down = jnp.stack(mlp_downs)
+    post_ffw_norm = jnp.stack(post_ffw_norms)
+
+    return (
+        embed,
+        pre_attention_norm,
+        pre_ffw_norm,
+        attn_q,
+        attn_kv,
+        attn_o,
+        post_attention_norm,
+        mlp_gate,
+        mlp_up,
+        mlp_down,
+        post_ffw_norm
+    )
+
+
+# %%
+(embed,
+ m_ln1,
+ m_ln2,
+ m_w_q,
+ m_w_kv,
+ m_w_o,
+ m_post_attn_ln,
+ m_w_gate,
+ m_w_up,
+ m_w_down,
+ m_post_ffn_ln) = flatten_params_to_tensors(params, h)
+
+# %%
+i = 0
 ids = dummy_input
 x = embed[ids]
 x *= jnp.sqrt(h.d_model)
-nx = rms_norm(x) * (1.0 + ln1)
-q = einsum(
-    nx, w_q, "B Qlen d_model, d_model n_kv n_q_per_kv d_head -> B Qlen n_kv n_q_per_kv d_head")
-k, v = einsum(
-    nx, w_kv, "B Klen d_model, k_v d_model n_kv d_head -> k_v B Klen n_kv d_head"
-)
-# %%
-q = rope_table.apply("L d -> 1 L 1 1 d", q)
-k = rope_table.apply("L d -> 1 L 1 d", k)
-q_test = rearrange(
-    q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head",
-)
-q_preatt_scalar = h.d_head ** -0.5
-q_scaled = q * q_preatt_scalar
-print(compare_tensors(q_scaled, intermediates['reshaped_scaled_q'][0]))
-# %%
-logits = einsum(
-    q_scaled, k, 'B Qlen n_kv n_q_per_kv d_head, B Klen n_kv d_head -> B Qlen n_kv n_q_per_kv Klen')
-logits = jnp.tanh(logits / h.attn_softcap) * h.attn_softcap
-logits_test = rearrange(
-    logits, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen")
-print(compare_tensors(logits_test, intermediates['capped_logits'][0]))
-# %%
-attn_mask = jax.lax.select(
-    use_local_window_attn,
-    jnp.logical_and(causal_mask, local_mask),
-    causal_mask,
-)
-logits = jnp.where(attn_mask, logits, -1e10)
-probs = (jax.nn.softmax(logits, axis=-1).astype(logits.dtype))
-probs_test = rearrange(
-    probs, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen"
-)
-print(compare_tensors(probs_test, intermediates['att_wei'][0]))
-# %%
-a_out = einsum(
-    probs, v, "B Qlen n_kv n_q_per_kv Klen, B Klen n_kv d_head -> B Qlen n_kv n_q_per_kv d_head"
-)
-a_out = einsum(
-    a_out, w_o, "B Qlen n_kv n_q_per_kv d_head, d_model n_kv n_q_per_kv d_head -> B Qlen d_model"
-)
-print(compare_tensors(a_out, intermediates['a_out'][0]))
-a_out = rms_norm(a_out) * (1.0 + post_att_ln)
-print(compare_tensors(a_out, intermediates['post_attention_norm'][0]))
-x += a_out
-nx = rms_norm(x) * (1.0 + ln2)
-print(compare_tensors(nx, intermediates['pre_ffw_norm'][0]))
-# %%
-# ffw network
-# FFN, using SwiGLU
-gate_proj = einsum(nx, w_gate, "B L M, M F -> B L F")
-up_proj = einsum(nx, w_up, "B L M, M F -> B L F")
-y = jax.nn.gelu(gate_proj) * up_proj
-ffn_out = einsum(y, w_down, "B L F, M F -> B L M")
-print(compare_tensors(ffn_out, intermediates['mlp'][0]))
-ffn_out = rms_norm(ffn_out) * (1.0 + post_ffw_ln)
-print(compare_tensors(ffn_out, intermediates['post_ffw_norm'][0]))
+print('run 3')
+# def loop_body(carry, layer_weights):
+#     (x, use_local_window_attn) = carry
+for i in range(2):
+    layer_weights = [
+        m_w_q[i],
+        m_w_kv[i],
+        m_w_o[i],
+        m_w_gate[i],
+        m_w_up[i],
+        m_w_down[i],
+        m_ln1[i],
+        m_ln2[i],
+        m_post_attn_ln[i],
+        m_post_ffn_ln[i]
+    ]
+    w_q, w_kv, w_o, w_gate, w_up, w_down, ln1, ln2, post_attn_ln, post_ffn_ln = layer_weights
 
+    nx = rms_norm(x) * (1.0 + ln1)
+    q = einsum(
+        nx, w_q, "B Qlen d_model, d_model n_kv n_q_per_kv d_head -> B Qlen n_kv n_q_per_kv d_head")
+    k, v = einsum(
+        nx, w_kv, "B Klen d_model, k_v d_model n_kv d_head -> k_v B Klen n_kv d_head"
+    )
+    q = rope_table.apply("L d -> 1 L 1 1 d", q)
+    k = rope_table.apply("L d -> 1 L 1 d", k)
+    q_preatt_scalar = h.d_head ** -0.5
+    q_scaled = q * q_preatt_scalar
+    print(compare_tensors(
+        q_scaled, intermediates['reshaped_scaled_q'][i]))
+    logits = einsum(
+        q_scaled, k, 'B Qlen n_kv n_q_per_kv d_head, B Klen n_kv d_head -> B Qlen n_kv n_q_per_kv Klen')
+    logits = jnp.tanh(logits / h.attn_softcap) * h.attn_softcap
+    logits_test = rearrange(
+        logits, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen")
+    print(compare_tensors(logits_test, intermediates['capped_logits'][i]))
+    attn_mask = jax.lax.select(
+        use_local_window_attn,
+        jnp.logical_and(causal_mask, local_mask),
+        causal_mask,
+    )
+    logits = jnp.where(attn_mask, logits, -2.3819763e38)
+    logits_test = rearrange(
+        logits, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen"
+    )
+    print(compare_tensors(logits_test, intermediates['masked_logits'][i]))
+    probs = (jax.nn.softmax(logits, axis=-1).astype(logits.dtype))
+    probs_test = rearrange(
+        probs, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen"
+    )
+    print("att_wei aligned: ", compare_tensors(
+        probs_test, intermediates['att_wei'][i]))
+    encoded = einsum(
+        probs, v, "B Qlen n_kv n_q_per_kv Klen, B Klen n_kv d_head -> B Qlen n_kv n_q_per_kv d_head"
+    )
 
+    encoded = rearrange(
+        encoded, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head"
+    )
+
+    print("attn_out before MHA mix aligned: ", compare_tensors(
+        encoded, intermediates['a_out_premix'][i]))
+
+    # mixing mha is wrong...
+    # attn_out = einsum(
+    #     encoded, w_o, "B Qlen n_head d_head, n_head d_head d_model  -> B Qlen d_model"
+    # )
+    attn_out2 = einsum(
+        encoded, w_o, "B T N H, N H D -> B T D"
+    )
+
+    # abcd cde  abe
+    attn_out = jnp.einsum('BTNH,NHD->BTD', encoded, w_o)
+    print(attn_out)
+    print('2', attn_out2)
+    print(attn_out.shape)
+    print('2', attn_out2.dtype)
+    print(attn_out.dtype)
+
+    print("attn_out 2 after w_o aligned: ", compare_tensors(
+        attn_out, attn_out2))
+
+    print("attn_out after w_o aligned: ", compare_tensors(
+        attn_out, intermediates['a_out'][i]))
+
+    # attn_out = intermediates['a_out'][i]
+    attn_out = rms_norm(attn_out) * (1.0 + post_attn_ln)
+    print(compare_tensors(attn_out, intermediates['post_attention_norm'][i]))
+    x += attn_out
+    nx = rms_norm(x) * (1.0 + ln2)
+    print(compare_tensors(nx, intermediates['pre_ffw_norm'][i]))
+    gate_proj = einsum(nx, w_gate, "B L M, M F -> B L F")
+    up_proj = einsum(nx, w_up, "B L M, M F -> B L F")
+    y = jax.nn.gelu(gate_proj) * up_proj
+    ffn_out = einsum(y, w_down, "B L F, M F -> B L M")
+    print(compare_tensors(ffn_out, intermediates['mlp'][i]))
+    ffn_out = rms_norm(ffn_out) * (1.0 + post_ffn_ln)
+    print((compare_tensors(
+        ffn_out, intermediates['post_ffw_norm'][i])))
+    x = x + ffn_out
+    compare_tensors(x, intermediates['final_output'][i])
+    use_local_window_attn = not use_local_window_attn
+    print('\n')
+
+# return (jnp.bfloat16(x + ffn_out), ~use_local_window_attn), ()
 # %%
+# %%
+# (x, _), () = jax.lax.scan(
+# loop_body,
+# (jnp.bfloat16(x), False),
+# (
+#     w_q,
+#     w_kv,
+#     w_o,
+#     w_gate,
+#     w_up,
+#     w_down,
+#     ln1,
+#     ln2,
+#     post_attn_ln,
+#     post_ffn_ln
+# ),
+# )
