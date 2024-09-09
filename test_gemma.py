@@ -145,43 +145,6 @@ def rms_norm(x):
     return x * jax.lax.rsqrt(var + 1e-06)
 
 
-class RopeTable:
-    def __init__(self, max_len: int, h: Hparams) -> None:
-        head_dim = h.d_head
-        position = jnp.arange(max_len, dtype=jnp.int32)
-        fraction = 2 * jnp.arange(0, head_dim // 2) / head_dim
-        timescale = h.rope_max_timescale**fraction
-
-        sinusoid_inp = jnp.float32(
-            position[:, jnp.newaxis]) / timescale[jnp.newaxis, :]
-        self.sin = jnp.sin(sinusoid_inp)
-        self.cos = jnp.cos(sinusoid_inp)
-
-    def apply(self, rearrange_spec, x):
-        x1, x2 = jnp.split(x, 2, axis=-1)
-        sin = rearrange(self.sin, rearrange_spec)
-        cos = rearrange(self.cos, rearrange_spec)
-        r1 = x1 * cos - x2 * sin
-        r2 = x2 * cos + x1 * sin
-        return jnp.concatenate([r1, r2], axis=-1).astype(x.dtype)
-
-
-# %%
-L = seq_length
-h = Hparams()
-K_MASK = -2.3819763e38
-rope_table = RopeTable(seq_length, h)
-use_local_window_attn = False
-causal_mask = jnp.tril(
-    jnp.ones((batch_size, L, L), dtype=jnp.bool_), 0
-)[..., jnp.newaxis, jnp.newaxis, :]
-local_mask = jnp.triu(
-    jnp.ones((batch_size, L, L), dtype=jnp.bool_), 1 - h.window_size
-)[..., jnp.newaxis, jnp.newaxis, :]
-
-# %%
-
-
 def flatten_params_to_tensors(params, h):
     # Use h.n_layers instead of counting
     num_layers = h.layers
@@ -258,6 +221,42 @@ def flatten_params_to_tensors(params, h):
         final_layer_norm
     )
 
+
+class RopeTable:
+    def __init__(self, max_len: int, h: Hparams) -> None:
+        head_dim = h.d_head
+        position = jnp.arange(max_len, dtype=jnp.int32)
+        fraction = 2 * jnp.arange(0, head_dim // 2) / head_dim
+        timescale = h.rope_max_timescale**fraction
+
+        sinusoid_inp = jnp.float32(
+            position[:, jnp.newaxis]) / timescale[jnp.newaxis, :]
+        self.sin = jnp.sin(sinusoid_inp)
+        self.cos = jnp.cos(sinusoid_inp)
+
+    def apply(self, rearrange_spec, x):
+        x1, x2 = jnp.split(x, 2, axis=-1)
+        sin = rearrange(self.sin, rearrange_spec)
+        cos = rearrange(self.cos, rearrange_spec)
+        r1 = x1 * cos - x2 * sin
+        r2 = x2 * cos + x1 * sin
+        return jnp.concatenate([r1, r2], axis=-1).astype(x.dtype)
+
+
+# %%
+L = seq_length
+h = Hparams()
+K_MASK = -2.3819763e38
+rope_table = RopeTable(seq_length, h)
+use_local_window_attn = False
+causal_mask = jnp.tril(
+    jnp.ones((batch_size, L, L), dtype=jnp.bool_), 0
+)[..., jnp.newaxis, jnp.newaxis, :]
+local_mask = jnp.triu(
+    jnp.ones((batch_size, L, L), dtype=jnp.bool_), 1 - h.window_size
+)[..., jnp.newaxis, jnp.newaxis, :]
+
+# %%
 
 # %%
 (embed,
@@ -399,3 +398,5 @@ print(compare_tensors(
 logits = jnp.tanh(logits / h.final_softcap) * h.final_softcap
 print(compare_tensors(
     logits, intermediates['final_softcap']))
+
+# %%
