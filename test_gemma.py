@@ -20,7 +20,6 @@ os.environ["XLA_FLAGS"] = (
 
 
 kagglehub.login()
-# %%
 kagglehub.model_download("google/gemma-2/flax/gemma2-2b")
 
 # %%
@@ -47,7 +46,6 @@ dummy_attention_mask = jnp.tril(
     jnp.ones((batch_size, seq_length, seq_length), dtype=jnp.bool_), 0
 )
 
-# %%
 (logits, cache), intermediates = transformer.apply(
     {'params': params["transformer"]},
     dummy_input,
@@ -57,8 +55,6 @@ dummy_attention_mask = jnp.tril(
     capture_intermediates=True
 
 )
-
-# %%
 
 
 def flatten_intermediates(intermediates):
@@ -106,10 +102,7 @@ def flatten_intermediates(intermediates):
     return flattened
 
 
-# %%
 intermediates = flatten_intermediates(intermediates)
-
-# %%
 
 
 class Hparams:
@@ -280,7 +273,129 @@ x *= jnp.sqrt(h.d_model)
 print(compare_tensors(x, intermediates['tracked_embed']))
 
 
-# def loop_body(carry, layer_weights):
+def loop_body(carry, layer_weights):
+    w_q, w_kv, w_o, w_gate, w_up, w_down, ln1, ln2, post_attn_ln, post_ffn_ln = layer_weights
+
+    (x, use_local_window_attn, i) = carry
+
+    jax.debug.print('layer {i} \n', i=i)
+    print('initial carry dtype \n', x.dtype)
+
+    nx = rms_norm(x) * (1.0 + ln1)
+    jax.debug.print("normed x alignment={b}", b=compare_tensors(
+        nx, intermediates['pre_attention_norm'][i]))
+
+    # realigning
+    # nx = intermediates['pre_attention_norm'][i]
+
+    q = einsum(
+        nx, w_q, "B Qlen d_model, d_model n_kv n_q_per_kv d_head -> B Qlen n_kv n_q_per_kv d_head"
+    ).astype(x)
+    k, v = einsum(
+        nx, w_kv, "B Klen d_model, k_v d_model n_kv d_head -> k_v B Klen n_kv d_head"
+    ).astype(x)
+
+    q = rope_table.apply("L d -> 1 L 1 1 d", q)
+    k = rope_table.apply("L d -> 1 L 1 d", k)
+    q_preatt_scalar = h.d_head ** -0.5
+    q_scaled = q * q_preatt_scalar
+
+    jax.debug.print("roped_q alignment = {b}", b=compare_tensors(
+        q_scaled, intermediates['reshaped_scaled_q'][i]))
+    jax.debug.print("roped_k alignment = {b}", b=compare_tensors(
+        k, intermediates['roped_k'][i]))
+
+    logits = einsum(
+        q_scaled, k, 'B Qlen n_kv n_q_per_kv d_head, B Klen n_kv d_head -> B Qlen n_kv n_q_per_kv Klen')
+    logits = jnp.tanh(logits / h.attn_softcap) * h.attn_softcap
+    logits_test = rearrange(
+        logits, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen")
+    jax.debug.print("capped logits alignment={b}", b=compare_tensors(
+        logits_test, intermediates['capped_logits'][i]))
+
+    attn_mask = jax.lax.select(
+        use_local_window_attn,
+        jnp.logical_and(causal_mask, local_mask),
+        causal_mask,
+    )
+    logits = jnp.where(attn_mask, logits, -2.3819763e38)
+    logits_test = rearrange(
+        logits, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen"
+    )
+    jax.debug.print("masked logits alignment={b}", b=compare_tensors(
+        logits_test, intermediates['masked_logits'][i]))
+
+    probs = (jax.nn.softmax(logits, axis=-1).astype(x.dtype))
+    probs_test = rearrange(
+        probs, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen"
+    )
+    jax.debug.print("att wei alignment={b}", b=compare_tensors(
+        probs_test, intermediates['att_wei'][i]))
+
+    encoded = einsum(
+        probs, v, "B Qlen n_kv n_q_per_kv Klen, B Klen n_kv d_head -> B Qlen n_kv n_q_per_kv d_head"
+    )
+
+    encoded = rearrange(
+        encoded, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head"
+    )
+
+    # jax.debug.print("attn_out before MHA mix aligned: {b}", b=compare_tensors(
+    #     encoded, intermediates['a_out_premix'][i]))
+
+    # realigning
+    encoded = intermediates['a_out_premix'][i]
+
+    # for some reason: mixing mha is wrong here...
+    # attn_out = einsum(
+    #     encoded, w_o, "B Qlen n_head d_head, n_head d_head d_model  -> B Qlen d_model"
+    # )
+    # but correct here:
+    attn_out = jnp.einsum('BTNH,NHD->BTD', encoded, w_o)
+
+    jax.debug.print("attn_out after w_o alignment: {b}", b=compare_tensors(
+        attn_out, intermediates['a_out'][i]))
+
+    # realigning
+    # attn_out = intermediates['a_out'][i]
+
+    attn_out = rms_norm(attn_out) * (1.0 + post_attn_ln)
+    jax.debug.print("post attn norm alignment = {b}", b=compare_tensors(
+        attn_out, intermediates['post_attention_norm'][i]))
+
+    # realigning
+    attn_out = intermediates['post_attention_norm'][i]
+
+    x += attn_out
+    nx = rms_norm(x) * (1.0 + ln2)
+    jax.debug.print("pre ffw norm alignment = {b}", b=compare_tensors(
+        nx, intermediates['pre_ffw_norm'][i]))
+
+    # realigning
+    # nx = intermediates['pre_ffw_norm'][i]
+
+    gate_proj = einsum(nx, w_gate, "B L M, M F -> B L F")
+    up_proj = einsum(nx, w_up, "B L M, M F -> B L F")
+    y = jax.nn.gelu(gate_proj) * up_proj
+    ffn_out = einsum(y, w_down, "B L F, M F -> B L M")
+    jax.debug.print("ffn_out alignment = {b}", b=compare_tensors(
+        ffn_out, intermediates['mlp'][i]))
+
+    # realigning
+    # ffn_out = intermediates['mlp'][i]
+    ffn_out = rms_norm(ffn_out) * (1.0 + post_ffn_ln)
+    jax.debug.print("post_ffw_norm alignment = {b}", b=(compare_tensors(
+        ffn_out, intermediates['post_ffw_norm'][i])))
+
+    # realigning
+    ffn_out = intermediates['post_ffw_norm'][i]
+    x += ffn_out
+
+    print('final carry dtype \n', x.dtype)
+
+    return (jnp.bfloat16(x), ~use_local_window_attn, i+1), ()
+
+
 for i in range(h.layers):
     layer_weights = [
         m_w_q[i],
@@ -294,99 +409,9 @@ for i in range(h.layers):
         m_post_attn_ln[i],
         m_post_ffn_ln[i]
     ]
-    # (x, use_local_window_attn) = carry
-    w_q, w_kv, w_o, w_gate, w_up, w_down, ln1, ln2, post_attn_ln, post_ffn_ln = layer_weights
+    (x, use_local_window_attn, i), _ = loop_body(
+        (x, use_local_window_attn, i), layer_weights)
 
-    nx = rms_norm(x) * (1.0 + ln1)
-    q = einsum(
-        nx, w_q, "B Qlen d_model, d_model n_kv n_q_per_kv d_head -> B Qlen n_kv n_q_per_kv d_head")
-    k, v = einsum(
-        nx, w_kv, "B Klen d_model, k_v d_model n_kv d_head -> k_v B Klen n_kv d_head"
-    )
-    q = rope_table.apply("L d -> 1 L 1 1 d", q)
-    k = rope_table.apply("L d -> 1 L 1 d", k)
-    q_preatt_scalar = h.d_head ** -0.5
-    q_scaled = q * q_preatt_scalar
-    # print(compare_tensors(
-    #     q_scaled, intermediates['reshaped_scaled_q'][i]))
-    logits = einsum(
-        q_scaled, k, 'B Qlen n_kv n_q_per_kv d_head, B Klen n_kv d_head -> B Qlen n_kv n_q_per_kv Klen')
-    logits = jnp.tanh(logits / h.attn_softcap) * h.attn_softcap
-    logits_test = rearrange(
-        logits, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen")
-    # print(compare_tensors(logits_test, intermediates['capped_logits'][i]))
-    attn_mask = jax.lax.select(
-        use_local_window_attn,
-        jnp.logical_and(causal_mask, local_mask),
-        causal_mask,
-    )
-    logits = jnp.where(attn_mask, logits, -2.3819763e38)
-    logits_test = rearrange(
-        logits, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen"
-    )
-    # print(compare_tensors(logits_test, intermediates['masked_logits'][i]))
-    probs = (jax.nn.softmax(logits, axis=-1).astype(logits.dtype))
-    probs_test = rearrange(
-        probs, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen"
-    )
-    # print("att_wei aligned: ", compare_tensors(
-    # probs_test, intermediates['att_wei'][i]))
-    encoded = einsum(
-        probs, v, "B Qlen n_kv n_q_per_kv Klen, B Klen n_kv d_head -> B Qlen n_kv n_q_per_kv d_head"
-    )
-
-    encoded = rearrange(
-        encoded, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head"
-    )
-
-    # print("attn_out before MHA mix aligned: ", compare_tensors(
-    # encoded, intermediates['a_out_premix'][i]))
-
-    # for some reason: mixing mha is wrong here...
-    # attn_out = einsum(
-    #     encoded, w_o, "B Qlen n_head d_head, n_head d_head d_model  -> B Qlen d_model"
-    # )
-    # but correct here:
-    attn_out = jnp.einsum('BTNH,NHD->BTD', encoded, w_o)
-
-    # print("attn_out after w_o aligned: ", compare_tensors(
-    #     attn_out, intermediates['a_out'][i]))
-
-    # attn_out = intermediates['a_out'][i]
-    attn_out = rms_norm(attn_out) * (1.0 + post_attn_ln)
-    # print(compare_tensors(attn_out, intermediates['post_attention_norm'][i]))
-    x += attn_out
-    nx = rms_norm(x) * (1.0 + ln2)
-    # print(compare_tensors(nx, intermediates['pre_ffw_norm'][i]))
-    gate_proj = einsum(nx, w_gate, "B L M, M F -> B L F")
-    up_proj = einsum(nx, w_up, "B L M, M F -> B L F")
-    y = jax.nn.gelu(gate_proj) * up_proj
-    ffn_out = einsum(y, w_down, "B L F, M F -> B L M")
-    # print(compare_tensors(ffn_out, intermediates['mlp'][i]))
-    ffn_out = rms_norm(ffn_out) * (1.0 + post_ffn_ln)
-    # print((compare_tensors(
-    #     ffn_out, intermediates['post_ffw_norm'][i])))
-    x = x + ffn_out
-
-    # return (x, ~use_local_window_attn), ()
-
-
-# (x, _), () = jax.lax.scan(
-#     loop_body,
-#     (x, False),
-#     (
-#         m_w_q,
-#         m_w_kv,
-#         m_w_o,
-#         m_w_gate,
-#         m_w_up,
-#         m_w_down,
-#         m_ln1,
-#         m_ln2,
-#         m_post_attn_ln,
-#         m_post_ffn_ln
-#     ),
-# )
 x = rms_norm(x) * (1.0 + m_final_layer_norm)
 print(compare_tensors(
     x, intermediates['final_norm']))
@@ -398,5 +423,40 @@ print(compare_tensors(
 logits = jnp.tanh(logits / h.final_softcap) * h.final_softcap
 print(compare_tensors(
     logits, intermediates['final_softcap']))
+
+
+# %%
+i = 0
+ids = dummy_input
+x = embed[ids]
+x *= jnp.sqrt(h.d_model)
+(x, _, _), () = jax.lax.scan(
+    loop_body,
+    (x, False, i),
+    (
+        m_w_q,
+        m_w_kv,
+        m_w_o,
+        m_w_gate,
+        m_w_up,
+        m_w_down,
+        m_ln1,
+        m_ln2,
+        m_post_attn_ln,
+        m_post_ffn_ln
+    ),
+)
+x = rms_norm(x) * (1.0 + m_final_layer_norm)
+print(compare_tensors(
+    x, intermediates['final_norm']))
+logits = einsum(
+    x, embed, "B L M, V M ->B L V"
+)
+print(compare_tensors(
+    logits, intermediates['tracked_unembed']))
+logits = jnp.tanh(logits / h.final_softcap) * h.final_softcap
+print(compare_tensors(
+    logits, intermediates['final_softcap']))
+
 
 # %%
